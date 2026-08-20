@@ -6,7 +6,8 @@
  *   POST /toy-cmd     AI 发送控制指令（需要 x-bridge-secret）
  *   GET  /toy-next    手机中继轮询取指令
  *   GET  /toy-status  查看当前状态
- *   GET  /             健康检查 + toy.html 前端页面
+ *   GET  /health      健康检查
+ *   GET  /            前端页面（index.html）
  */
 
 const express = require("express");
@@ -35,8 +36,10 @@ function auth(req, res, next) {
   next();
 }
 
-// ---------- 静态文件（toy.html）----------
-app.use(express.static(path.join(__dirname, "public")));
+// ---------- 根路由：返回前端页面 ----------
+app.get("/", (req, res) => {
+  res.sendFile(path.join(__dirname, "index.html"));
+});
 
 // ---------- AI → 服务器：发指令 ----------
 app.post("/toy-cmd", auth, (req, res) => {
@@ -47,7 +50,7 @@ app.post("/toy-cmd", auth, (req, res) => {
   cmdQueue.push(cmd);
   lastCmd = cmd;
   lastCmdTime = Date.now();
-  console.log(`📨 收到指令: ${JSON.stringify(cmd)}`);
+  console.log(`收到指令: ${JSON.stringify(cmd)}`);
   res.json({ ok: true, queued: cmdQueue.length });
 });
 
@@ -81,6 +84,6 @@ app.get("/health", (req, res) => {
 
 // ---------- 启动 ----------
 app.listen(PORT, () => {
-  console.log(`🚀 SVAKOM Bridge Server running on port ${PORT}`);
+  console.log(`SVAKOM Bridge Server running on port ${PORT}`);
   console.log(`   SECRET: ${SECRET ? "已设置" : "未设置（不安全）"}`);
 });
