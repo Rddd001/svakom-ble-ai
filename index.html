@@ -1,0 +1,372 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0,user-scalable=no">
+<title>SL278H BLE 中继</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    font-family: -apple-system, 'Helvetica Neue', sans-serif;
+    background: #0a0a0f;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex; flex-direction: column; align-items: center;
+    padding: 20px;
+  }
+  h1 { font-size: 20px; margin-bottom: 6px; color: #ff6b9d; }
+  .sub { font-size: 12px; color: #666; margin-bottom: 20px; }
+  .card {
+    background: #16161e;
+    border: 1px solid #2a2a3a;
+    border-radius: 12px;
+    padding: 16px;
+    width: 100%; max-width: 400px;
+    margin-bottom: 12px;
+  }
+  .status-dot {
+    display: inline-block;
+    width: 10px; height: 10px;
+    border-radius: 50%;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  .dot-off { background: #555; }
+  .dot-ble { background: #4fc3f7; }
+  .dot-srv { background: #81c784; }
+  .dot-active { background: #ff6b9d; animation: pulse 1.5s infinite; }
+  @keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.3; } }
+  button {
+    width: 100%;
+    padding: 14px;
+    border: none; border-radius: 10px;
+    font-size: 16px; font-weight: 600;
+    cursor: pointer;
+    margin-bottom: 8px;
+    transition: all .2s;
+  }
+  .btn-connect { background: #4fc3f7; color: #000; }
+  .btn-connect:active { background: #29b6f6; }
+  .btn-disconnect { background: #ef5350; color: #fff; }
+  .btn-disconnect:active { background: #c62828; }
+  .btn-connect:disabled { background: #333; color: #666; }
+  #log {
+    background: #0d0d14;
+    border: 1px solid #1e1e2e;
+    border-radius: 8px;
+    padding: 10px;
+    font-family: 'Courier New', monospace;
+    font-size: 11px;
+    height: 200px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+    color: #aaa;
+    width: 100%; max-width: 400px;
+  }
+  .label { font-size: 12px; color: #888; margin-bottom: 4px; }
+  .val { font-size: 14px; font-weight: 600; }
+  .row { display: flex; justify-content: space-between; margin-bottom: 8px; }
+  input[type="text"] {
+    width: 100%;
+    padding: 10px;
+    border: 1px solid #2a2a3a;
+    border-radius: 8px;
+    background: #0d0d14;
+    color: #e0e0e0;
+    font-size: 14px;
+    margin-bottom: 8px;
+  }
+</style>
+</head>
+<body>
+
+<h1>🔗 SL278H BLE 中继</h1>
+<p class="sub">在手机 Chrome 打开此页面，连接设备</p>
+
+<div class="card">
+  <div class="label">服务器地址</div>
+  <input type="text" id="serverUrl" placeholder="自动使用当前页面地址">
+  <div class="label">密钥</div>
+  <input type="text" id="secret" placeholder="BRIDGE_SECRET">
+  <button class="btn-connect" id="btnConnect" onclick="startBridge()">连接设备并开始中继</button>
+  <button class="btn-disconnect" id="btnDisconnect" onclick="stopBridge()" style="display:none">断开</button>
+</div>
+
+<div class="card">
+  <div class="row">
+    <div>
+      <div class="label">BLE 设备</div>
+      <div class="val"><span class="status-dot dot-off" id="dotBle"></span><span id="bleStatus">未连接</span></div>
+    </div>
+    <div>
+      <div class="label">服务器</div>
+      <div class="val"><span class="status-dot dot-off" id="dotSrv"></span><span id="srvStatus">未连接</span></div>
+    </div>
+  </div>
+  <div class="row">
+    <div>
+      <div class="label">指令计数</div>
+      <div class="val" id="cmdCount">0</div>
+    </div>
+    <div>
+      <div class="label">当前状态</div>
+      <div class="val"><span class="status-dot dot-off" id="dotActive"></span><span id="activeStatus">待机</span></div>
+    </div>
+  </div>
+</div>
+
+<div id="log">等待连接...\n</div>
+
+<script>
+const SVC_UUID  = 0xffe0;
+const WRITE_UUID = "0000ffe1-0000-1000-8000-00805f9b34fb";
+const NOTIFY_UUID = "0000ffe2-0000-1000-8000-00805f9b34fb";
+const H = 0x55;
+const KEEPALIVE_MS = 1500;
+const POLL_MS = 300;
+
+let device = null;
+let server = null;
+let writeChar = null;
+let running = false;
+let pollTimer = null;
+let keepaliveTimer = null;
+let currentCmd = null;
+let currentUntil = 0;
+let cmdCounter = 0;
+
+const logEl = document.getElementById("log");
+function log(s) {
+  const t = new Date().toLocaleTimeString();
+  logEl.textContent += `[${t}] ${s}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function getServerUrl() {
+  const input = document.getElementById("serverUrl").value.trim();
+  if (input) return input.replace(/\/+$/, "");
+  return window.location.origin;
+}
+
+function getSecret() {
+  return document.getElementById("secret").value.trim();
+}
+
+// ---------- BLE 命令构造 ----------
+function cmdScale(v) {
+  v = Math.max(0, Math.min(255, v));
+  return new Uint8Array([H, 4, 0, 0, 1, v, 0xAA]);
+}
+function cmdStop() {
+  return new Uint8Array([H, 4, 0, 0, 0, 0, 0xAA]);
+}
+function cmdVibrate(mode, level) {
+  mode = Math.max(1, Math.min(8, mode));
+  level = Math.max(1, Math.min(5, level));
+  return new Uint8Array([H, 3, 0, 0, mode, level, 0]);
+}
+
+// ---------- BLE 写入 ----------
+async function bleWrite(buf) {
+  if (!writeChar) return;
+  try {
+    await writeChar.writeValueWithoutResponse(buf);
+  } catch (e) {
+    log(`⚠️ 写入失败: ${e.message}`);
+  }
+}
+
+// ---------- 解析并执行指令 ----------
+async function execCmd(c) {
+  if (!c || Object.keys(c).length === 0) return;
+
+  cmdCounter++;
+  document.getElementById("cmdCount").textContent = cmdCounter;
+
+  if (c.stop) {
+    currentCmd = null; currentUntil = 0;
+    await bleWrite(cmdStop());
+    setActive("已停止");
+    log("⏹ 停止");
+    return;
+  }
+
+  // 解析持续时间
+  let until = 0;
+  for (const k of ["sec", "seconds", "duration"]) {
+    if (c[k] && parseFloat(c[k]) > 0) {
+      until = Date.now() + parseFloat(c[k]) * 1000;
+      break;
+    }
+  }
+
+  if (c.pattern !== undefined) {
+    const mode = parseInt(c.pattern);
+    const level = Math.max(1, Math.round((c.level || 0.6) * 5));
+    currentCmd = cmdVibrate(mode, level);
+    currentUntil = until;
+    await bleWrite(currentCmd);
+    setActive(`花样${mode}`);
+    log(`🌀 花样 ${mode} 档 ${level}`);
+    return;
+  }
+
+  const val = c.speed ?? c.suck ?? c.intensity;
+  if (val !== undefined) {
+    const fv = parseFloat(val);
+    if (fv <= 0) {
+      currentCmd = null; currentUntil = 0;
+      await bleWrite(cmdStop());
+      setActive("已停止");
+      log("⏹ 强度 0");
+      return;
+    }
+    currentCmd = cmdScale(Math.round(fv * 255));
+    currentUntil = until;
+    await bleWrite(currentCmd);
+    setActive(`${Math.round(fv * 100)}%`);
+    log(`📳 强度 ${Math.round(fv * 100)}%`);
+  }
+}
+
+// ---------- 续命循环 ----------
+function startKeepalive() {
+  keepaliveTimer = setInterval(async () => {
+    if (currentUntil && Date.now() >= currentUntil) {
+      currentCmd = null; currentUntil = 0;
+      await bleWrite(cmdStop());
+      setActive("超时停");
+      log("⏱ 到时自动停");
+      return;
+    }
+    if (currentCmd) {
+      await bleWrite(currentCmd);
+    }
+  }, KEEPALIVE_MS);
+}
+
+// ---------- 服务器轮询 ----------
+function startPolling() {
+  const baseUrl = getServerUrl();
+  const secret = getSecret();
+  const headers = {};
+  if (secret) headers["x-bridge-secret"] = secret;
+
+  pollTimer = setInterval(async () => {
+    try {
+      const r = await fetch(`${baseUrl}/toy-next`, { headers });
+      if (r.ok) {
+        const c = await r.json();
+        if (c && Object.keys(c).length > 0 && c.type !== "hello") {
+          log(`📨 ${JSON.stringify(c)}`);
+          await execCmd(c);
+        }
+      }
+      setSrv(true);
+    } catch (e) {
+      setSrv(false);
+    }
+  }, POLL_MS);
+}
+
+// ---------- UI 状态更新 ----------
+function setBle(on, name) {
+  const dot = document.getElementById("dotBle");
+  const st = document.getElementById("bleStatus");
+  dot.className = `status-dot ${on ? "dot-ble" : "dot-off"}`;
+  st.textContent = on ? name : "未连接";
+}
+function setSrv(on) {
+  const dot = document.getElementById("dotSrv");
+  const st = document.getElementById("srvStatus");
+  dot.className = `status-dot ${on ? "dot-srv" : "dot-off"}`;
+  st.textContent = on ? "已连接" : "断开";
+}
+function setActive(s) {
+  const dot = document.getElementById("dotActive");
+  const st = document.getElementById("activeStatus");
+  const isActive = s && s !== "待机" && s !== "已停止" && s !== "超时停";
+  dot.className = `status-dot ${isActive ? "dot-active" : "dot-off"}`;
+  st.textContent = s || "待机";
+}
+
+// ---------- 主流程 ----------
+async function startBridge() {
+  try {
+    log("🔍 请在弹窗中选择 SL278H 设备...");
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: "SL278" }],
+      optionalServices: [SVC_UUID]
+    });
+    log(`✅ 选中设备: ${device.name}`);
+
+    device.addEventListener("gattserverdisconnected", () => {
+      log("❌ BLE 断开！");
+      setBle(false);
+      setActive("待机");
+      stopPolling();
+    });
+
+    log("🔗 连接 GATT...");
+    server = await device.gatt.connect();
+
+    log("🔎 获取服务...");
+    const svc = await server.getPrimaryService(SVC_UUID);
+
+    log("🔎 获取特征...");
+    writeChar = await svc.getCharacteristic(WRITE_UUID);
+
+    // 尝试监听 notify（不是必须的）
+    try {
+      const notifyChar = await svc.getCharacteristic(NOTIFY_UUID);
+      await notifyChar.startNotifications();
+      notifyChar.addEventListener("characteristicvaluechanged", () => {});
+      log("📡 Notify 已启用");
+    } catch (e) {
+      log("ℹ️ Notify 不可用（不影响）");
+    }
+
+    setBle(true, device.name);
+    log("🎉 BLE 就绪！开始轮询服务器...");
+
+    document.getElementById("btnConnect").style.display = "none";
+    document.getElementById("btnDisconnect").style.display = "block";
+
+    running = true;
+    startPolling();
+    startKeepalive();
+
+  } catch (e) {
+    log(`❌ 错误: ${e.message}`);
+  }
+}
+
+function stopPolling() {
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+  if (keepaliveTimer) { clearInterval(keepaliveTimer); keepaliveTimer = null; }
+}
+
+function stopBridge() {
+  running = false;
+  stopPolling();
+  currentCmd = null;
+  currentUntil = 0;
+  if (device && device.gatt.connected) {
+    device.gatt.disconnect();
+  }
+  setBle(false);
+  setSrv(false);
+  setActive("待机");
+  document.getElementById("btnConnect").style.display = "block";
+  document.getElementById("btnDisconnect").style.display = "none";
+  log("🔌 已断开所有连接");
+}
+
+// 页面加载时自动填入服务器地址
+window.addEventListener("load", () => {
+  document.getElementById("serverUrl").value = window.location.origin;
+});
+</script>
+</body>
+</html>
